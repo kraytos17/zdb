@@ -6,7 +6,6 @@ const btree = @import("btree.zig");
 const crc32c = std.hash.crc.Crc32Iscsi;
 
 pub const Key = u64;
-pub const Value = u64;
 
 pub const WalOp = enum(u8) {
     set = 1,
@@ -84,7 +83,6 @@ pub const Wal = struct {
         }
     }
 
-    /// Compute CRC32 of two buffers (for SET records)
     fn crc32cTwo(a: []const u8, b: []const u8) u32 {
         var h = crc32c.init();
         crc32c.update(&h, a);
@@ -92,7 +90,6 @@ pub const Wal = struct {
         return crc32c.final(h);
     }
 
-    /// Compute CRC32 of a single buffer (for HEADER and DELETE records)
     fn crc32cOne(a: []const u8) u32 {
         var h = crc32c.init();
         crc32c.update(&h, a);
@@ -243,7 +240,7 @@ test "WAL appendSet writes correct bytes" {
     defer file.close();
 
     var wal = Wal.init(file);
-    const key: u64 = 12345;
+    const key: Key = 12345;
     const value = "hello";
 
     const pos = try wal.appendSet(key, value);
@@ -304,7 +301,7 @@ test "WAL appendDelete writes correct bytes" {
     defer file.close();
 
     var wal = Wal.init(file);
-    const key: u64 = 999;
+    const key: Key = 999;
     const pos = try wal.appendDelete(key);
 
     try testing.expectEqual(@as(u64, Wal.HEADER_SIZE), pos);
