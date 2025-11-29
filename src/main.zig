@@ -1,24 +1,46 @@
 const std = @import("std");
+const fs = std.fs;
+
+const Db = @import("db.zig").Db;
+const print = std.debug.print;
+
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-}
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    const cwd = std.fs.cwd();
+    print("Opening DB...\n", .{});
+    var db = try Db.open(cwd, "demo.db", allocator);
+    defer db.close() catch {};
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    print("Running demo operations...\n\n", .{});
+    print("SET(1, \"hello\")\n", .{});
+    try db.set(1, "hello");
+
+    print("SET(2, \"world\")\n", .{});
+    try db.set(2, "world");
+
+    if (try db.get(1)) |v| {
+        print("GET(1) = \"{s}\"\n", .{v});
+    } else {
+        print("GET(1) = null\n", .{});
+    }
+
+    if (try db.get(2)) |v| {
+        print("GET(2) = \"{s}\"\n", .{v});
+    } else {
+        print("GET(2) = null\n", .{});
+    }
+
+    print("\nDELETE(1)\n", .{});
+    try db.delete(1);
+
+    if (try db.get(1)) |v| {
+        print("GET(1) = \"{s}\"\n", .{v});
+    } else {
+        print("GET(1) = null (expected)\n", .{});
+    }
+
+    print("\nDone. Restart the program to verify WAL replay.\n", .{});
 }
