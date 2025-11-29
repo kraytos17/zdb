@@ -80,11 +80,7 @@ pub const BTree = struct {
     }
 
     pub fn search(self: *Self, key: Key) ?Value {
-        if (self.root) |r| {
-            return searchNode(r, key);
-        } else {
-            return null;
-        }
+        return if (self.root) |r| searchNode(r, key) else null;
     }
 
     pub fn insert(self: *Self, key: Key, value: Value) !void {
@@ -129,9 +125,8 @@ pub const BTree = struct {
         }
         if (node.children[i]) |child| {
             return searchNode(child, key);
-        } else {
-            return null;
         }
+        return null;
     }
 
     fn insertNonFull(self: *Self, node: *Node, key: Key, value: Value) !void {

@@ -58,7 +58,7 @@ pub const Pager = struct {
     }
 
     pub fn close(self: *Self) !void {
-        self.flush() catch {};
+        try self.flush();
         var it = self.cache.valueIterator();
         while (it.next()) |entry_ptr| {
             self.allocator.free(entry_ptr.*.page.buf);
@@ -69,6 +69,10 @@ pub const Pager = struct {
         self.wal.deinit();
         self.allocator.destroy(self.wal);
         self.file.close();
+    }
+
+    pub fn getWal(self: *Self) *Wal {
+        return self.wal;
     }
 
     pub fn get(self: *Self, page_id: u32) !*CacheEntry {

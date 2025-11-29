@@ -171,52 +171,78 @@ pub const Wal = struct {
         return pos;
     }
 
-    pub fn replay(self: *Self, allocator: mem.Allocator, index: *btree.BTree) !void {
+    inline fn checkHandlerType(handler: anytype) void {
+        const T = @TypeOf(handler);
+
+        comptime {
+            const info = @typeInfo(T);
+            if (info != .pointer) {
+                @compileError("WAL replay handler must be a *struct pointer.");
+            }
+
+            const child = info.pointer.child;
+            const child_info = @typeInfo(child);
+            if (child_info != .@"struct") {
+                @compileError("WAL replay handler must be a pointer to a struct.");
+            }
+
+            if (!@hasDecl(child, "handleSet")) {
+                @compileError(
+                    \\WAL replay handler struct must declare:
+                    \\    pub fn handleSet(self: *Self, key: Key, value: []const u8) !void
+                );
+            }
+            if (!@hasDecl(child, "handleDelete")) {
+                @compileError(
+                    \\WAL replay handler struct must declare:
+                    \\    pub fn handleDelete(self: *Self, key: Key) !void
+                );
+            }
+        }
+    }
+
+    pub fn replayFn(self: *Self, allocator: mem.Allocator, handler: anytype) !void {
+        checkHandlerType(handler);
         try self.ensureHeader();
         try self.file.seekTo(HEADER_SIZE);
 
         while (true) {
-            const record_pos = self.file.getPos() catch 0;
             var opb: [1]u8 = undefined;
             const n = try self.file.read(opb[0..]);
-            if (n == 0) break;
+            if (n == 0) break; // End of WAL
 
             const op = std.enums.fromInt(WalOp, opb[0]) orelse return WalError.InvalidWalOp;
             var kbuf: [8]u8 = undefined;
-            try readExact(&self.file, kbuf[0..]);
-            const key = mem.readInt(u64, &kbuf, .little);
 
+            try readExact(&self.file, kbuf[0..]);
+            const key = mem.readInt(u64, kbuf[0..], .little);
             switch (op) {
                 .set => {
                     var lbuf: [4]u8 = undefined;
-                    try readExact(&self.file, &lbuf);
-                    const len = mem.readInt(u32, &lbuf, .little);
+                    try readExact(&self.file, lbuf[0..]);
+                    const len = mem.readInt(u32, lbuf[0..], .little);
 
                     var cbuf: [4]u8 = undefined;
-                    try readExact(&self.file, &cbuf);
-                    const stored_cs = mem.readInt(u32, &cbuf, .little);
+                    try readExact(&self.file, cbuf[0..]);
+                    const stored_cs = mem.readInt(u32, cbuf[0..], .little);
 
                     const value_buf = try allocator.alloc(u8, len);
                     defer allocator.free(value_buf);
                     try readExact(&self.file, value_buf);
 
                     const calc_cs = recordChecksumSet(op, key, value_buf);
-                    if (stored_cs != calc_cs) {
-                        return WalError.BadChecksum;
-                    }
-
-                    try index.insert(key, record_pos);
+                    if (stored_cs != calc_cs) return WalError.BadChecksum;
+                    try handler.handleSet(key, value_buf);
                 },
+
                 .delete => {
                     var cbuf: [4]u8 = undefined;
-                    try readExact(&self.file, &cbuf);
-                    const stored_cs = mem.readInt(u32, &cbuf, .little);
-
+                    try readExact(&self.file, cbuf[0..]);
+                    const stored_cs = mem.readInt(u32, cbuf[0..], .little);
                     const calc_cs = recordChecksumDelete(op, key);
-                    if (stored_cs != calc_cs) {
-                        return WalError.BadChecksum;
-                    }
-                    index.delete(key);
+
+                    if (stored_cs != calc_cs) return WalError.BadChecksum;
+                    try handler.handleDelete(key);
                 },
             }
         }
@@ -326,19 +352,29 @@ test "WAL appendDelete writes correct bytes" {
     try testing.expectEqual(calc_cs, stored_cs);
 }
 
-test "WAL replay reconstructs BTree for SET records" {
+test "checkHandlerType allows correct handler" {
+    const Handler = struct {
+        pub fn handleSet(_: *@This(), _: Key, _: []const u8) !void {}
+        pub fn handleDelete(_: *@This(), _: Key) !void {}
+    };
+
+    comptime {
+        var h: Handler = .{};
+        Wal.checkHandlerType(&h);
+    }
+}
+
+test "WAL replayFn reconstructs BTree for SET records" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var file = try tmp.dir.createFile("wal_test3", .{ .read = true });
+    var file = try tmp.dir.createFile("wal_replay_set", .{ .read = true });
     defer file.close();
 
     var wal = Wal.init(file);
-    const pos1 = try wal.appendSet(10, "foo");
-    const pos2 = try wal.appendSet(20, "bar");
 
-    try testing.expectEqual(@as(u64, Wal.HEADER_SIZE), pos1);
-    try testing.expect(pos2 > pos1);
+    _ = try wal.appendSet(10, "foo");
+    _ = try wal.appendSet(20, "hello!");
 
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
@@ -346,27 +382,100 @@ test "WAL replay reconstructs BTree for SET records" {
     var index = btree.BTree.init(gpa.allocator());
     defer index.deinit();
 
-    try wal.replay(gpa.allocator(), &index);
-    try testing.expectEqual(@as(?u64, pos1), index.search(10));
-    try testing.expectEqual(@as(?u64, pos2), index.search(20));
+    var set_count: usize = 0;
+
+    const Handler = struct {
+        index: *btree.BTree,
+        set_count: *usize,
+
+        const Self = @This();
+
+        pub fn handleSet(self: *Self, key: Key, value: []const u8) !void {
+            self.set_count.* += 1;
+            try self.index.insert(key, @as(u64, value.len));
+        }
+
+        pub fn handleDelete(self: *Self, key: Key) !void {
+            self.index.delete(key);
+        }
+    };
+
+    var handler = Handler{
+        .index = &index,
+        .set_count = &set_count,
+    };
+
+    try wal.replayFn(gpa.allocator(), &handler);
+
+    try testing.expectEqual(@as(?u64, 3), index.search(10));
+    try testing.expectEqual(@as(?u64, 6), index.search(20));
+    try testing.expectEqual(@as(usize, 2), set_count);
 }
 
-test "WAL replay stops cleanly on truncated/partial record" {
+test "WAL replayFn applies DELETE records" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var file = try tmp.dir.createFile("wal_test5", .{ .read = true });
+    var file = try tmp.dir.createFile("wal_replay_delete", .{ .read = true });
+    defer file.close();
+
+    var wal = Wal.init(file);
+    _ = try wal.appendSet(42, "hello");
+    _ = try wal.appendDelete(42);
+
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+
+    var index = btree.BTree.init(gpa.allocator());
+    defer index.deinit();
+
+    var delete_count: usize = 0;
+
+    const Handler = struct {
+        index: *btree.BTree,
+        delete_count: *usize,
+
+        const Self = @This();
+
+        pub fn handleSet(self: *Self, key: Key, value: []const u8) !void {
+            try self.index.insert(key, @as(u64, value.len));
+        }
+
+        pub fn handleDelete(self: *Self, key: Key) !void {
+            self.delete_count.* += 1;
+            self.index.delete(key);
+        }
+    };
+
+    var handler = Handler{ .index = &index, .delete_count = &delete_count };
+    try wal.replayFn(gpa.allocator(), &handler);
+
+    try testing.expectEqual(null, index.search(42));
+    try testing.expectEqual(@as(usize, 1), delete_count);
+}
+
+test "WAL replayFn stops cleanly on truncated/partial record" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("wal_replay_trunc", .{ .read = true });
     defer file.close();
 
     var header: [Wal.HEADER_SIZE]u8 = undefined;
-    header[0..4].* = "ZDB1".*;
-    mem.writeInt(u32, header[4..8], 1, .little);
+    header[0..4].* = Wal.MAGIC;
+    mem.writeInt(u32, header[4..8], Wal.VERSION, .little);
 
-    const hcs = Wal.crc32cOne(header[0..8]);
-    mem.writeInt(u32, header[8..12], hcs, .little);
+    const cs = Wal.crc32cOne(header[0..8]);
+    mem.writeInt(u32, header[8..12], cs, .little);
+
     try file.writeAll(header[0..]);
 
-    try file.writeAll(&[_]u8{ @intFromEnum(WalOp.set), 0xAA, 0xBB, 0xCC });
+    try file.writeAll(&[_]u8{
+        @intFromEnum(WalOp.set),
+        0xAA,
+        0xBB,
+        0xCC,
+    });
 
     var wal = Wal.init(file);
     var gpa = std.heap.DebugAllocator(.{}).init;
@@ -375,6 +484,30 @@ test "WAL replay stops cleanly on truncated/partial record" {
     var index = btree.BTree.init(gpa.allocator());
     defer index.deinit();
 
-    const result = wal.replay(gpa.allocator(), &index);
+    var invoked = false;
+
+    const Handler = struct {
+        index: *btree.BTree,
+        invoked_flag: *bool,
+
+        const Self = @This();
+
+        pub fn handleSet(self: *Self, key: Key, value: []const u8) !void {
+            self.invoked_flag.* = true; // MUST NEVER HAPPEN
+            try self.index.insert(key, @as(u64, value.len));
+        }
+
+        pub fn handleDelete(self: *Self, _: Key) !void {
+            self.invoked_flag.* = true; // MUST NEVER HAPPEN
+        }
+    };
+
+    var handler = Handler{
+        .index = &index,
+        .invoked_flag = &invoked,
+    };
+
+    const result = wal.replayFn(gpa.allocator(), &handler);
     try testing.expectError(error.UnexpectedEndOfFile, result);
+    try testing.expectEqual(false, invoked);
 }
