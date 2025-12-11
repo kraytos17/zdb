@@ -6,6 +6,7 @@ pub const Key = u64;
 pub const Value = u64;
 
 pub const DefaultOrder: usize = 8;
+const MAX_HEIGHT: usize = 32;
 
 pub fn BTreeInternal(comptime T: usize) type {
     comptime {
@@ -62,21 +63,37 @@ pub fn BTreeInternal(comptime T: usize) type {
 
         pub const Cursor = struct {
             tree: *Self,
-            node: ?*Node,
-            idx: usize,
+            nodes: [MAX_HEIGHT]?*Node,
+            idxs: [MAX_HEIGHT]usize,
+            height: usize,
+
+            pub fn initEmpty(tree: *Self) Cursor {
+                return Cursor{
+                    .tree = tree,
+                    .nodes = undefined,
+                    .idxs = undefined,
+                    .height = 0,
+                };
+            }
 
             pub fn isValid(self: *Cursor) bool {
-                return self.node != null;
+                return self.height > 0;
+            }
+
+            fn topNode(self: *Cursor) *Node {
+                return self.nodes[self.height - 1].?;
             }
 
             pub fn key(self: *Cursor) Key {
-                const n = self.node orelse @panic("Cursor not valid");
-                return n.keys[self.idx];
+                if (!self.isValid()) @panic("Cursor not valid");
+                const n = self.topNode();
+                return n.keys[self.idxs[self.height - 1]];
             }
 
             pub fn value(self: *Cursor) Value {
-                const n = self.node orelse @panic("Cursor not valid");
-                return n.values[self.idx];
+                if (!self.isValid()) @panic("Cursor not valid");
+                const n = self.topNode();
+                return n.values[self.idxs[self.height - 1]];
             }
         };
 
@@ -180,52 +197,90 @@ pub fn BTreeInternal(comptime T: usize) type {
         }
 
         fn seekGeImpl(self: *Self, target: Key) Cursor {
-            var result = Cursor{ .tree = self, .node = null, .idx = 0 };
-            const root = self.root orelse return result;
-            var node = root;
+            var cur = Cursor.initEmpty(self);
+            var node = self.root orelse return cur;
+            var h: usize = 0;
             while (true) {
-                var i: usize = 0;
-                while (i < node.n and node.keys[i] < target) : (i += 1) {}
-                if (i < node.n) {
-                    const k = node.keys[i];
-                    if (!result.isValid() or k < result.key()) {
-                        result.node = node;
-                        result.idx = i;
-                    }
-                }
+                if (h >= MAX_HEIGHT) @panic("BTree height exceeded MaxHeight");
+                const idx = findKeyIdx(node, target);
+                cur.nodes[h] = node;
+                cur.idxs[h] = idx;
+                h += 1;
+
                 if (node.is_leaf) break;
-                const child = node.children[i] orelse break;
+                const child = node.children[idx] orelse break;
                 node = child;
             }
 
-            return result;
-        }
+            cur.height = h;
 
-        fn seekLeImpl(self: *Self, key: Key) Cursor {
-            var node = self.root orelse return Cursor{ .tree = self, .node = null, .idx = 0 };
-            var best: ?Cursor = null;
+            const top_idx = cur.idxs[cur.height - 1];
+            const top_node = cur.topNode();
+            if (top_idx < top_node.n) {
+                return cur;
+            }
 
-            while (true) {
-                const idx = findKeyIdx(node, key);
-                if (idx < node.n and node.keys[idx] == key) {
-                    return Cursor{ .tree = self, .node = node, .idx = idx };
-                }
-                if (idx > 0) {
-                    const k = node.keys[idx - 1];
-                    if (k <= key) {
-                        best = Cursor{ .tree = self, .node = node, .idx = idx - 1 };
-                    }
-                }
-                if (node.is_leaf) {
-                    return best orelse Cursor{ .tree = self, .node = null, .idx = 0 };
-                }
-                if (node.children[idx]) |child| {
-                    node = child;
-                } else {
-                    break;
+            while (cur.height > 0) {
+                cur.height -= 1;
+                if (cur.height == 0) break;
+                const parent_idx = cur.idxs[cur.height - 1];
+                const parent_node = cur.topNode();
+                if (parent_idx < parent_node.n) {
+                    return cur;
                 }
             }
-            return best orelse Cursor{ .tree = self, .node = null, .idx = 0 };
+
+            return Cursor.initEmpty(self);
+        }
+
+        fn seekLeImpl(self: *Self, target: Key) Cursor {
+            var cur = Cursor.initEmpty(self);
+            var node = self.root orelse return cur;
+            var h: usize = 0;
+            while (true) {
+                if (h >= MAX_HEIGHT) @panic("BTree height exceeded MaxHeight");
+                const idx = findKeyIdx(node, target);
+                cur.nodes[h] = node;
+                cur.idxs[h] = idx;
+                h += 1;
+
+                if (node.is_leaf) break;
+                const child_idx = idx;
+                const child = node.children[child_idx] orelse break;
+                node = child;
+            }
+
+            cur.height = h;
+            const top_idx = cur.idxs[cur.height - 1];
+            if (top_idx > 0) {
+                cur.idxs[cur.height - 1] = top_idx - 1;
+                return cur;
+            }
+
+            while (cur.height > 0) {
+                cur.height -= 1;
+                if (cur.height == 0) break;
+                const parent_idx = cur.idxs[cur.height - 1];
+                const parent_node = cur.topNode();
+                if (parent_idx > 0) {
+                    cur.idxs[cur.height - 1] = parent_idx - 1;
+                    var node2 = parent_node.children[parent_idx] orelse return cur;
+                    while (!node2.is_leaf) {
+                        if (cur.height >= MAX_HEIGHT) @panic("BTree height exceeded MaxHeight");
+                        const idx2 = node2.n;
+                        cur.nodes[cur.height] = node2;
+                        cur.idxs[cur.height] = idx2;
+                        cur.height += 1;
+                        node2 = node2.children[idx2] orelse break;
+                    }
+
+                    const top_i = cur.height - 1;
+                    cur.idxs[top_i] = cur.topNode().n - 1;
+                    return cur;
+                }
+            }
+
+            return Cursor.initEmpty(self);
         }
 
         pub const RangeCursor = struct {
@@ -237,7 +292,6 @@ pub fn BTreeInternal(comptime T: usize) type {
 
             pub fn isValid(self: *RangeCursor) bool {
                 if (!self.cur.isValid()) return false;
-
                 const k = self.cur.key();
                 return switch (self.dir) {
                     .forward => k >= self.start and k <= self.end,
@@ -267,26 +321,22 @@ pub fn BTreeInternal(comptime T: usize) type {
         };
 
         pub fn cursorFirst(self: *Self) Cursor {
-            if (self.root == null) {
-                return Cursor{
-                    .tree = self,
-                    .node = null,
-                    .idx = 0,
-                };
+            var c = Cursor.initEmpty(self);
+            var node = self.root orelse return c;
+            var h: usize = 0;
+            while (true) {
+                if (h >= MAX_HEIGHT) @panic("BTree height exceeded MaxHeight");
+                c.nodes[h] = node;
+                c.idxs[h] = 0;
+                h += 1;
+                if (node.is_leaf) break;
+                const child = node.children[0] orelse break;
+                node = child;
             }
 
-            var node = self.root.?;
-            while (!node.is_leaf) {
-                if (node.children[0]) |child| {
-                    node = child;
-                } else break;
-            }
-
-            if (node.n == 0) {
-                return Cursor{ .tree = self, .node = null, .idx = 0 };
-            }
-
-            return Cursor{ .tree = self, .node = node, .idx = 0 };
+            c.height = h;
+            if (c.height > 0 and c.topNode().n == 0) return Cursor.initEmpty(self);
+            return c;
         }
 
         pub fn cursorSeekGe(self: *Self, key: Key) Cursor {
@@ -297,54 +347,102 @@ pub fn BTreeInternal(comptime T: usize) type {
             return self.seekLeImpl(key);
         }
 
-        pub fn cursorNext(self: *Self, cur: *Cursor) void {
-            if (!cur.isValid()) return;
+        pub fn cursorNext(_: *Self, cur: *Cursor) void {
+            if (cur.height == 0) return;
 
-            const ck = cur.key();
-            if (ck == std.math.maxInt(Key)) {
-                cur.node = null;
-                cur.idx = 0;
+            const h = cur.height;
+            const node = cur.topNode();
+            const idx = cur.idxs[h - 1];
+            if (idx + 1 < node.n) {
+                cur.idxs[h - 1] = idx + 1;
                 return;
             }
 
-            cur.* = self.seekGeImpl(ck + 1);
+            var level: usize = h;
+            while (level > 1) : (level -= 1) {
+                const parent_idx = cur.idxs[level - 2];
+                const parent_node = cur.nodes[level - 2] orelse return;
+                if (parent_idx < parent_node.n) {
+                    cur.idxs[level - 2] = parent_idx + 1;
+                    var node_down = parent_node.children[parent_idx + 1] orelse {
+                        cur.height = 0;
+                        return;
+                    };
+
+                    var lvl = level - 1;
+                    while (true) {
+                        cur.nodes[lvl] = node_down;
+                        cur.idxs[lvl] = 0;
+                        lvl += 1;
+                        if (node_down.is_leaf) break;
+                        node_down = node_down.children[0] orelse break;
+                    }
+                    cur.height = lvl;
+                    return;
+                }
+            }
+            cur.height = 0;
         }
 
+        pub fn cursorPrev(_: *Self, cur: *Cursor) void {
+            if (cur.height == 0) return;
+
+            var h = cur.height;
+            const top_node = cur.topNode();
+            const top_idx = cur.idxs[h - 1];
+            if (!top_node.is_leaf) {
+                var node_down = top_node.children[top_idx] orelse unreachable;
+                var lvl = h;
+                while (true) {
+                    cur.nodes[lvl] = node_down;
+                    if (node_down.is_leaf) {
+                        cur.idxs[lvl] = if (node_down.n > 0) node_down.n - 1 else 0;
+                        cur.height = lvl + 1;
+                        return;
+                    }
+
+                    cur.idxs[lvl] = node_down.n;
+                    lvl += 1;
+                    node_down = node_down.children[node_down.n] orelse break;
+                }
+            }
+            if (top_idx > 0) {
+                cur.idxs[h - 1] = top_idx - 1;
+                return;
+            }
+
+            while (cur.height > 1) {
+                cur.height -= 1;
+                h = cur.height;
+                const parent_idx = cur.idxs[h - 1];
+                if (parent_idx > 0) {
+                    cur.idxs[h - 1] = parent_idx - 1;
+                    return;
+                }
+            }
+            cur.height = 0;
+        }
+        
         pub fn cursorLast(self: *Self) Cursor {
-            if (self.root == null) {
-                return Cursor{ .tree = self, .node = null, .idx = 0 };
+            var c = Cursor.initEmpty(self);
+            var node = self.root orelse return c;
+            var h: usize = 0;
+            while (true) {
+                c.nodes[h] = node;
+                if (node.is_leaf) {
+                    c.idxs[h] = if (node.n == 0) 0 else node.n - 1;
+                    h += 1;
+                    break;
+                }
+                c.idxs[h] = node.n;
+                const child = node.children[node.n] orelse break;
+                h += 1;
+                node = child;
             }
 
-            var node = self.root.?;
-            while (!node.is_leaf) {
-                const last_idx = node.n;
-                if (node.children[last_idx]) |child| {
-                    node = child;
-                } else break;
-            }
-
-            if (node.n == 0) {
-                return Cursor{ .tree = self, .node = null, .idx = 0 };
-            }
-
-            return Cursor{
-                .tree = self,
-                .node = node,
-                .idx = node.n - 1,
-            };
-        }
-
-        pub fn cursorPrev(self: *Self, cur: *Cursor) void {
-            if (!cur.isValid()) return;
-
-            const ck = cur.key();
-            if (ck == 0) {
-                cur.node = null;
-                cur.idx = 0;
-                return;
-            }
-
-            cur.* = self.seekLeImpl(ck - 1);
+            c.height = h;
+            if (c.height > 0 and c.topNode().n == 0) return Cursor.initEmpty(self);
+            return c;
         }
 
         pub fn rangeCursor(self: *Self, start: Key, end: Key, dir: Direction) RangeCursor {
@@ -353,12 +451,10 @@ pub fn BTreeInternal(comptime T: usize) type {
                 .reverse => self.cursorSeekLe(end),
             };
 
-            if (!cur.isValid()) {
-                cur.node = null;
-            } else {
+            if (!cur.isValid()) {} else {
                 const k = cur.key();
                 if (k < start or k > end) {
-                    cur.node = null;
+                    cur.height = 0;
                 }
             }
 
@@ -1200,21 +1296,15 @@ test "cursorLast and cursorPrev iterate backwards" {
     defer tree.deinit();
 
     for (1..21) |i| try tree.insert(i, i * 10);
-
     var cur = tree.cursorLast();
     try testing.expect(cur.isValid());
     try testing.expectEqual(@as(Key, 20), cur.key());
 
     var count: usize = 0;
-    var expected: Key = 20;
-
     while (cur.isValid()) {
-        try testing.expectEqual(expected, cur.key());
+        const k = cur.key();
+        try testing.expectEqual(@as(Key, 20 - count), k);
         count += 1;
-
-        if (expected == 1) break;
-        expected -= 1;
-
         tree.cursorPrev(&cur);
     }
 
