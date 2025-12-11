@@ -46,6 +46,7 @@ pub fn BTreeInternal(comptime T: usize) type {
     };
 
     const ValidateError = error{InvariantViolation};
+    const Direction = enum { forward, reverse };
 
     return struct {
         allocator: mem.Allocator,
@@ -179,34 +180,91 @@ pub fn BTreeInternal(comptime T: usize) type {
         }
 
         fn seekGeImpl(self: *Self, target: Key) Cursor {
-            var cur = Cursor{
-                .tree = self,
-                .node = null,
-                .idx = 0,
-            };
-
-            if (self.root == null)
-                return cur;
-
-            var node = self.root.?;
+            var result = Cursor{ .tree = self, .node = null, .idx = 0 };
+            const root = self.root orelse return result;
+            var node = root;
             while (true) {
                 var i: usize = 0;
                 while (i < node.n and node.keys[i] < target) : (i += 1) {}
                 if (i < node.n) {
-                    if (!cur.isValid() or node.keys[i] < cur.key()) {
-                        cur.node = node;
-                        cur.idx = i;
+                    const k = node.keys[i];
+                    if (!result.isValid() or k < result.key()) {
+                        result.node = node;
+                        result.idx = i;
                     }
                 }
-
                 if (node.is_leaf) break;
-                if (node.children[i]) |child| {
-                    node = child;
-                } else break;
+                const child = node.children[i] orelse break;
+                node = child;
             }
 
-            return cur;
+            return result;
         }
+
+        fn seekLeImpl(self: *Self, key: Key) Cursor {
+            var node = self.root orelse return Cursor{ .tree = self, .node = null, .idx = 0 };
+            var best: ?Cursor = null;
+
+            while (true) {
+                const idx = findKeyIdx(node, key);
+                if (idx < node.n and node.keys[idx] == key) {
+                    return Cursor{ .tree = self, .node = node, .idx = idx };
+                }
+                if (idx > 0) {
+                    const k = node.keys[idx - 1];
+                    if (k <= key) {
+                        best = Cursor{ .tree = self, .node = node, .idx = idx - 1 };
+                    }
+                }
+                if (node.is_leaf) {
+                    return best orelse Cursor{ .tree = self, .node = null, .idx = 0 };
+                }
+                if (node.children[idx]) |child| {
+                    node = child;
+                } else {
+                    break;
+                }
+            }
+            return best orelse Cursor{ .tree = self, .node = null, .idx = 0 };
+        }
+
+        pub const RangeCursor = struct {
+            tree: *Self,
+            cur: Cursor,
+            start: Key,
+            end: Key,
+            dir: Direction,
+
+            pub fn isValid(self: *RangeCursor) bool {
+                if (!self.cur.isValid()) return false;
+
+                const k = self.cur.key();
+                return switch (self.dir) {
+                    .forward => k >= self.start and k <= self.end,
+                    .reverse => k <= self.end and k >= self.start,
+                };
+            }
+
+            pub fn key(self: *RangeCursor) Key {
+                return self.cur.key();
+            }
+
+            pub fn value(self: *RangeCursor) Value {
+                return self.cur.value();
+            }
+
+            pub fn next(self: *RangeCursor) bool {
+                if (self.dir != .forward) @panic("Use prev() when dir=reverse");
+                self.tree.cursorNext(&self.cur);
+                return self.isValid();
+            }
+
+            pub fn prev(self: *RangeCursor) bool {
+                if (self.dir != .reverse) @panic("Use next() when dir=forward");
+                self.tree.cursorPrev(&self.cur);
+                return self.isValid();
+            }
+        };
 
         pub fn cursorFirst(self: *Self) Cursor {
             if (self.root == null) {
@@ -235,18 +293,82 @@ pub fn BTreeInternal(comptime T: usize) type {
             return self.seekGeImpl(key);
         }
 
+        pub fn cursorSeekLe(self: *Self, key: Key) Cursor {
+            return self.seekLeImpl(key);
+        }
+
         pub fn cursorNext(self: *Self, cur: *Cursor) void {
             if (!cur.isValid()) return;
 
-            const current_key = cur.key();
-            if (current_key == std.math.maxInt(Key)) {
+            const ck = cur.key();
+            if (ck == std.math.maxInt(Key)) {
                 cur.node = null;
                 cur.idx = 0;
                 return;
             }
 
-            const next = self.seekGeImpl(current_key + 1);
-            cur.* = next;
+            cur.* = self.seekGeImpl(ck + 1);
+        }
+
+        pub fn cursorLast(self: *Self) Cursor {
+            if (self.root == null) {
+                return Cursor{ .tree = self, .node = null, .idx = 0 };
+            }
+
+            var node = self.root.?;
+            while (!node.is_leaf) {
+                const last_idx = node.n;
+                if (node.children[last_idx]) |child| {
+                    node = child;
+                } else break;
+            }
+
+            if (node.n == 0) {
+                return Cursor{ .tree = self, .node = null, .idx = 0 };
+            }
+
+            return Cursor{
+                .tree = self,
+                .node = node,
+                .idx = node.n - 1,
+            };
+        }
+
+        pub fn cursorPrev(self: *Self, cur: *Cursor) void {
+            if (!cur.isValid()) return;
+
+            const ck = cur.key();
+            if (ck == 0) {
+                cur.node = null;
+                cur.idx = 0;
+                return;
+            }
+
+            cur.* = self.seekLeImpl(ck - 1);
+        }
+
+        pub fn rangeCursor(self: *Self, start: Key, end: Key, dir: Direction) RangeCursor {
+            var cur = switch (dir) {
+                .forward => self.cursorSeekGe(start),
+                .reverse => self.cursorSeekLe(end),
+            };
+
+            if (!cur.isValid()) {
+                cur.node = null;
+            } else {
+                const k = cur.key();
+                if (k < start or k > end) {
+                    cur.node = null;
+                }
+            }
+
+            return RangeCursor{
+                .tree = self,
+                .cur = cur,
+                .start = start,
+                .end = end,
+                .dir = dir,
+            };
         }
 
         fn insertNonFull(self: *Self, node: *Node, key: Key, value: Value) !void {
@@ -1067,4 +1189,34 @@ test "cursorSeekGe works" {
 
     cur = tree.cursorSeekGe(100);
     try testing.expect(!cur.isValid());
+}
+
+test "cursorLast and cursorPrev iterate backwards" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var tree = BTree.init(alloc);
+    defer tree.deinit();
+
+    for (1..21) |i| try tree.insert(i, i * 10);
+
+    var cur = tree.cursorLast();
+    try testing.expect(cur.isValid());
+    try testing.expectEqual(@as(Key, 20), cur.key());
+
+    var count: usize = 0;
+    var expected: Key = 20;
+
+    while (cur.isValid()) {
+        try testing.expectEqual(expected, cur.key());
+        count += 1;
+
+        if (expected == 1) break;
+        expected -= 1;
+
+        tree.cursorPrev(&cur);
+    }
+
+    try testing.expectEqual(@as(usize, 20), count);
 }
