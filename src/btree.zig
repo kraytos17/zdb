@@ -244,9 +244,13 @@ pub fn BTreeInternal(comptime T: usize) type {
                 cur.idxs[h] = idx;
                 h += 1;
 
+                if (idx < node.n and node.keys[idx] == target) {
+                    cur.height = h;
+                    return cur;
+                }
                 if (node.is_leaf) break;
-                const child_idx = idx;
-                const child = node.children[child_idx] orelse break;
+
+                const child = node.children[idx] orelse break;
                 node = child;
             }
 
@@ -261,21 +265,8 @@ pub fn BTreeInternal(comptime T: usize) type {
                 cur.height -= 1;
                 if (cur.height == 0) break;
                 const parent_idx = cur.idxs[cur.height - 1];
-                const parent_node = cur.topNode();
                 if (parent_idx > 0) {
                     cur.idxs[cur.height - 1] = parent_idx - 1;
-                    var node2 = parent_node.children[parent_idx] orelse return cur;
-                    while (!node2.is_leaf) {
-                        if (cur.height >= MAX_HEIGHT) @panic("BTree height exceeded MaxHeight");
-                        const idx2 = node2.n;
-                        cur.nodes[cur.height] = node2;
-                        cur.idxs[cur.height] = idx2;
-                        cur.height += 1;
-                        node2 = node2.children[idx2] orelse break;
-                    }
-
-                    const top_i = cur.height - 1;
-                    cur.idxs[top_i] = cur.topNode().n - 1;
                     return cur;
                 }
             }
@@ -422,7 +413,7 @@ pub fn BTreeInternal(comptime T: usize) type {
             }
             cur.height = 0;
         }
-        
+
         pub fn cursorLast(self: *Self) Cursor {
             var c = Cursor.initEmpty(self);
             var node = self.root orelse return c;
@@ -1309,4 +1300,145 @@ test "cursorLast and cursorPrev iterate backwards" {
     }
 
     try testing.expectEqual(@as(usize, 20), count);
+}
+
+test "RangeCursor: basic forward and reverse" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    var tree = BTree.init(gpa.allocator());
+    defer tree.deinit();
+
+    const nums = [_]u64{ 10, 20, 30, 40, 50 };
+    for (nums) |n| try tree.insert(n, n);
+    {
+        var rc = tree.rangeCursor(20, 40, .forward);
+        try testing.expect(rc.isValid());
+        try testing.expectEqual(@as(Key, 20), rc.key());
+
+        try testing.expect(rc.next());
+        try testing.expectEqual(@as(Key, 30), rc.key());
+
+        try testing.expect(rc.next());
+        try testing.expectEqual(@as(Key, 40), rc.key());
+
+        try testing.expect(!rc.next());
+        try testing.expect(!rc.isValid());
+    }
+    {
+        var rc = tree.rangeCursor(20, 40, .reverse);
+        try testing.expect(rc.isValid());
+        try testing.expectEqual(@as(Key, 40), rc.key());
+
+        try testing.expect(rc.prev());
+        try testing.expectEqual(@as(Key, 30), rc.key());
+
+        try testing.expect(rc.prev());
+        try testing.expectEqual(@as(Key, 20), rc.key());
+
+        try testing.expect(!rc.prev());
+    }
+}
+
+test "RangeCursor: fuzzy boundaries" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    var tree = BTree.init(gpa.allocator());
+    defer tree.deinit();
+
+    const nums = [_]u64{ 10, 20, 30, 40, 50 };
+    for (nums) |n| try tree.insert(n, n);
+    {
+        var rc = tree.rangeCursor(15, 45, .forward);
+        try testing.expectEqual(@as(Key, 20), rc.key());
+        _ = rc.next();
+        try testing.expectEqual(@as(Key, 30), rc.key());
+        _ = rc.next();
+        try testing.expectEqual(@as(Key, 40), rc.key());
+        try testing.expect(!rc.next());
+    }
+    {
+        var rc = tree.rangeCursor(15, 45, .reverse);
+        try testing.expectEqual(@as(Key, 40), rc.key());
+        _ = rc.prev();
+        try testing.expectEqual(@as(Key, 30), rc.key());
+        _ = rc.prev();
+        try testing.expectEqual(@as(Key, 20), rc.key());
+        try testing.expect(!rc.prev());
+    }
+}
+
+test "RangeCursor: out of bounds and empty" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    var tree = BTree.init(gpa.allocator());
+    defer tree.deinit();
+
+    try tree.insert(10, 10);
+    try tree.insert(20, 20);
+
+    {
+        var rc = tree.rangeCursor(0, 5, .forward);
+        try testing.expect(!rc.isValid());
+    }
+    {
+        var rc = tree.rangeCursor(30, 40, .forward);
+        try testing.expect(!rc.isValid());
+    }
+    {
+        var rc = tree.rangeCursor(12, 18, .forward);
+        try testing.expect(!rc.isValid());
+    }
+    {
+        var rc = tree.rangeCursor(12, 18, .reverse);
+        try testing.expect(!rc.isValid());
+    }
+}
+
+test "RangeCursor: single key exact match" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    var tree = BTree.init(gpa.allocator());
+    defer tree.deinit();
+
+    try tree.insert(10, 10);
+    try tree.insert(20, 20);
+    try tree.insert(30, 30);
+
+    {
+        var rc = tree.rangeCursor(20, 20, .forward);
+        try testing.expect(rc.isValid());
+        try testing.expectEqual(@as(Key, 20), rc.key());
+        try testing.expect(!rc.next());
+    }
+    {
+        var rc = tree.rangeCursor(20, 20, .reverse);
+        try testing.expect(rc.isValid());
+        try testing.expectEqual(@as(Key, 20), rc.key());
+        try testing.expect(!rc.prev());
+    }
+}
+
+test "RangeCursor: large scale reverse iteration" {
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    var tree = BTree.init(gpa.allocator());
+    defer tree.deinit();
+
+    var i: usize = 1;
+    while (i <= 100) : (i += 1) {
+        try tree.insert(@intCast(i), @intCast(i));
+    }
+
+    var rc = tree.rangeCursor(1, 100, .reverse);
+    var expected: u64 = 100;
+    var count: usize = 0;
+    while (rc.isValid()) {
+        try testing.expectEqual(expected, rc.key());
+        if (expected > 0) expected -= 1;
+        count += 1;
+        if (!rc.prev()) break;
+    }
+
+    try testing.expectEqual(@as(usize, 100), count);
+    try testing.expectEqual(@as(u64, 0), expected);
 }
