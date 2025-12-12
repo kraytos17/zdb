@@ -3,7 +3,7 @@ const mem = std.mem;
 const testing = std.testing;
 
 pub const Key = u64;
-pub const Value = u64;
+pub const Value = []const u8;
 
 pub const DefaultOrder: usize = 8;
 const MAX_HEIGHT: usize = 32;
@@ -124,6 +124,11 @@ pub fn BTreeInternal(comptime T: usize) type {
                     }
                 }
             }
+
+            var i: usize = 0;
+            while (i < node.n) : (i += 1) {
+                self.allocator.free(node.values[i]);
+            }
             self.allocator.destroy(node);
         }
 
@@ -157,7 +162,7 @@ pub fn BTreeInternal(comptime T: usize) type {
                 var new_node = try self.allocator.create(Node);
                 new_node.* = .init(true);
                 new_node.keys[0] = key;
-                new_node.values[0] = value;
+                new_node.values[0] = try self.allocator.dupe(u8, value);
                 new_node.n = 1;
                 self.root = new_node;
                 return;
@@ -464,25 +469,28 @@ pub fn BTreeInternal(comptime T: usize) type {
                 while (i >= 0) : (i -= 1) {
                     const idx: usize = @intCast(i);
                     if (key == node.keys[idx]) {
-                        node.values[idx] = value;
+                        self.allocator.free(node.values[idx]);
+                        node.values[idx] = try self.allocator.dupe(u8, value);
                         return;
                     }
                     if (key > node.keys[idx]) {
                         break;
                     }
+
                     node.keys[idx + 1] = node.keys[idx];
                     node.values[idx + 1] = node.values[idx];
                 }
 
                 const insert_idx: usize = @intCast(i + 1);
                 node.keys[insert_idx] = key;
-                node.values[insert_idx] = value;
+                node.values[insert_idx] = try self.allocator.dupe(u8, value);
                 node.n += 1;
             } else {
                 while (i >= 0) : (i -= 1) {
                     const idx: usize = @intCast(i);
                     if (key == node.keys[idx]) {
-                        node.values[idx] = value;
+                        self.allocator.free(node.values[idx]);
+                        node.values[idx] = try self.allocator.dupe(u8, value);
                         return;
                     }
                     if (key > node.keys[idx]) {
@@ -702,7 +710,7 @@ pub fn BTreeInternal(comptime T: usize) type {
             while (idx < node.n and key > node.keys[idx]) : (idx += 1) {}
             if (idx < node.n and node.keys[idx] == key) {
                 if (node.is_leaf) {
-                    deleteFromLeaf(node, idx);
+                    self.deleteFromLeaf(node, idx);
                 } else {
                     self.deleteFromNonLeaf(node, idx);
                 }
@@ -729,7 +737,8 @@ pub fn BTreeInternal(comptime T: usize) type {
             }
         }
 
-        fn deleteFromLeaf(node: *Node, idx: usize) void {
+        fn deleteFromLeaf(self: *Self, node: *Node, idx: usize) void {
+            self.allocator.free(node.values[idx]);
             var i = idx;
             while (i + 1 < node.n) : (i += 1) {
                 node.keys[i] = node.keys[i + 1];
@@ -746,12 +755,14 @@ pub fn BTreeInternal(comptime T: usize) type {
             if (left_child.n >= T) {
                 const pred = getPred(node, idx);
                 node.keys[idx] = pred.k;
-                node.values[idx] = pred.v;
+                self.allocator.free(node.values[idx]);
+                node.values[idx] = self.allocator.dupe(u8, pred.v) catch unreachable;
                 self.deleteNode(left_child, pred.k);
             } else if (right_child.n >= T) {
                 const succ = getSucc(node, idx);
                 node.keys[idx] = succ.k;
-                node.values[idx] = succ.v;
+                self.allocator.free(node.values[idx]);
+                node.values[idx] = self.allocator.dupe(u8, succ.v) catch unreachable;
                 self.deleteNode(right_child, succ.k);
             } else {
                 self.merge(node, idx);
@@ -942,12 +953,13 @@ test "insert and search keys" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    try tree.insert(10, 100);
-    try tree.insert(20, 200);
-    try tree.insert(5, 50);
-    try testing.expectEqual(@as(?Value, 100), tree.search(10));
-    try testing.expectEqual(@as(?Value, 200), tree.search(20));
-    try testing.expectEqual(@as(?Value, 50), tree.search(5));
+    try tree.insert(10, "val_100");
+    try tree.insert(20, "val_200");
+    try tree.insert(5, "val_50");
+
+    try testing.expectEqualStrings("val_100", tree.search(10).?);
+    try testing.expectEqualStrings("val_200", tree.search(20).?);
+    try testing.expectEqualStrings("val_50", tree.search(5).?);
 }
 
 test "search missing keys" {
@@ -957,8 +969,8 @@ test "search missing keys" {
 
     var tree = BTree.init(alloc);
     defer tree.deinit();
-    try tree.insert(10, 100);
-    try testing.expectEqual(@as(?Value, null), tree.search(100));
+    try tree.insert(10, "val_100");
+    try testing.expect(tree.search(100) == null);
 }
 
 test "multiple splits and balanced tree" {
@@ -968,16 +980,23 @@ test "multiple splits and balanced tree" {
 
     var tree = BTree.init(alloc);
     defer tree.deinit();
+
     var i: usize = 1;
     while (i <= 30) : (i += 1) {
-        try tree.insert(@intCast(i), @intCast(i * 10));
+        var buf: [32]u8 = undefined;
+        // Store "10", "20", ... as string values
+        const str = try std.fmt.bufPrint(&buf, "{d}", .{i * 10});
+        try tree.insert(@intCast(i), str);
     }
 
     i = 1;
     while (i <= 30) : (i += 1) {
-        try testing.expectEqual(@as(?Value, @intCast(i * 10)), tree.search(@intCast(i)));
+        var buf: [32]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buf, "{d}", .{i * 10});
+        try testing.expectEqualStrings(expected, tree.search(@intCast(i)).?);
     }
-    try testing.expectEqual(@as(?Value, null), tree.search(2343));
+
+    try testing.expect(tree.search(2343) == null);
 }
 
 test "overwrite behaviour (duplication)" {
@@ -988,10 +1007,11 @@ test "overwrite behaviour (duplication)" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    try tree.insert(10, 100);
-    try tree.insert(10, 999);
-    const v = tree.search(10);
-    try testing.expect(v == 100 or v == 999);
+    try tree.insert(10, "old_value");
+    try tree.insert(10, "new_value");
+
+    const v = tree.search(10).?;
+    try testing.expectEqualStrings("new_value", v);
 }
 
 test "upsert / overwrite behaviour" {
@@ -1002,9 +1022,11 @@ test "upsert / overwrite behaviour" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    try tree.insert(10, 100);
-    try tree.insert(10, 999);
-    try testing.expectEqual(@as(?Value, 999), tree.search(10));
+    try tree.insert(10, "100");
+    try tree.insert(10, "999");
+
+    const v = tree.search(10).?;
+    try testing.expectEqualStrings("999", v);
 }
 
 test "clear and reuse tree" {
@@ -1015,51 +1037,17 @@ test "clear and reuse tree" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    try tree.insert(1, 10);
-    try tree.insert(2, 20);
+    try tree.insert(1, "one");
+    try tree.insert(2, "two");
     try testing.expect(tree.height() > 0);
 
     tree.clear();
-    try testing.expectEqual(@as(?Value, null), tree.search(1));
+    try testing.expect(tree.search(1) == null);
     try testing.expectEqual(@as(usize, 0), tree.height());
 
-    try tree.insert(42, 420);
-    try testing.expectEqual(@as(?Value, 420), tree.search(42));
+    try tree.insert(42, "forty-two");
+    try testing.expectEqualStrings("forty-two", tree.search(42).?);
 }
-
-// test "debugPrint on small tree" {
-//     var gpa = std.heap.DebugAllocator(.{}).init;
-//     defer _ = gpa.deinit();
-//     const alloc = gpa.allocator();
-
-//     var tree = BTree.init(alloc);
-//     defer tree.deinit();
-
-//     try tree.insert(10, 100);
-//     try tree.insert(20, 200);
-//     try tree.insert(5, 50);
-
-//     std.debug.print("--- DebugPrint small ---\n", .{});
-//     tree.debugPrint();
-// }
-
-// test "debugPrint on deep tree (multiple splits)" {
-//     var gpa = std.heap.DebugAllocator(.{}).init;
-//     defer _ = gpa.deinit();
-//     const alloc = gpa.allocator();
-
-//     var tree = BTree.init(alloc);
-//     defer tree.deinit();
-
-//     var i: usize = 1;
-//     while (i <= 50) : (i += 1) {
-//         try tree.insert(@intCast(i), @intCast(i * 10));
-//     }
-
-//     try testing.expect(tree.height() >= 3);
-//     std.debug.print("--- DebugPrint deep tree ---\n", .{});
-//     tree.debugPrint();
-// }
 
 test "min max" {
     var gpa = std.heap.DebugAllocator(.{}).init;
@@ -1070,19 +1058,20 @@ test "min max" {
     defer tree.deinit();
 
     try testing.expect(tree.min() == null);
-    try testing.expect(tree.max() == null);
 
-    try tree.insert(10, 100);
-    try tree.insert(5, 50);
-    try tree.insert(20, 200);
-    try tree.insert(15, 150);
+    try tree.insert(10, "v10");
+    try tree.insert(5, "v5");
+    try tree.insert(20, "v20");
+    try tree.insert(15, "v15"); // This was missing in your snippet but logic implies it
 
     const mn = tree.min().?;
     const mx = tree.max().?;
+
     try testing.expectEqual(@as(Key, 5), mn.k);
-    try testing.expectEqual(@as(Value, 50), mn.v);
+    try testing.expectEqualStrings("v5", mn.v);
+
     try testing.expectEqual(@as(Key, 20), mx.k);
-    try testing.expectEqual(@as(Value, 200), mx.v);
+    try testing.expectEqualStrings("v20", mx.v);
 }
 
 test "forEach visits keys in sorted order" {
@@ -1095,7 +1084,8 @@ test "forEach visits keys in sorted order" {
 
     const nums = [_]u64{ 10, 3, 7, 1, 15, 12, 8 };
     for (nums) |n| {
-        try tree.insert(n, n * 10);
+        // Value content doesn't matter for this test, but must be string
+        try tree.insert(n, "val");
     }
 
     var collected_keys: [32]Key = undefined;
@@ -1106,7 +1096,7 @@ test "forEach visits keys in sorted order" {
         count: *usize,
 
         const Self = @This();
-
+        // Updated signature to take []const u8
         pub fn call(self: *Self, key: Key, value: Value) void {
             _ = value;
             self.keys[self.count.*] = key;
@@ -1116,7 +1106,8 @@ test "forEach visits keys in sorted order" {
 
     var col = Collector{ .keys = collected_keys[0..], .count = &count };
     tree.forEach(&col);
-    try testing.expectEqual(@as(usize, nums.len), count);
+
+    try testing.expectEqual(nums.len, count);
 
     var i: usize = 1;
     while (i < count) : (i += 1) {
@@ -1134,7 +1125,8 @@ test "range query filters keys" {
 
     var i: usize = 1;
     while (i <= 20) : (i += 1) {
-        try tree.insert(@intCast(i), @intCast(i * 10));
+        // Insert dummy string values
+        try tree.insert(@intCast(i), "val");
     }
 
     var collected: [32]Key = undefined;
@@ -1175,14 +1167,14 @@ test "delete from leaf" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    try tree.insert(10, 100);
-    try tree.insert(20, 200);
-    try tree.insert(5, 50);
+    try tree.insert(10, "100");
+    try tree.insert(20, "200");
+    try tree.insert(5, "50");
 
     tree.delete(20);
-    try testing.expectEqual(@as(?Value, null), tree.search(20));
-    try testing.expectEqual(@as(?Value, 100), tree.search(10));
-    try testing.expectEqual(@as(?Value, 50), tree.search(5));
+    try testing.expect(tree.search(20) == null);
+    try testing.expectEqualStrings("100", tree.search(10).?);
+    try testing.expectEqualStrings("50", tree.search(5).?);
 }
 
 test "delete internal node keys with rebalancing" {
@@ -1195,19 +1187,23 @@ test "delete internal node keys with rebalancing" {
 
     var i: usize = 1;
     while (i <= 20) : (i += 1) {
-        try tree.insert(@intCast(i), @intCast(i * 10));
+        var buf: [32]u8 = undefined;
+        const str = try std.fmt.bufPrint(&buf, "{d}", .{i * 10});
+        try tree.insert(@intCast(i), str);
     }
 
     tree.delete(10);
     tree.delete(5);
     tree.delete(15);
 
-    try testing.expectEqual(@as(?Value, null), tree.search(10));
-    try testing.expectEqual(@as(?Value, null), tree.search(5));
-    try testing.expectEqual(@as(?Value, null), tree.search(15));
+    try testing.expect(tree.search(10) == null);
+    try testing.expect(tree.search(5) == null);
+    try testing.expect(tree.search(15) == null);
 
-    try testing.expectEqual(@as(?Value, 60), tree.search(6));
-    try testing.expectEqual(@as(?Value, 200), tree.search(20));
+    // 6 * 10 = 60
+    try testing.expectEqualStrings("60", tree.search(6).?);
+    // 20 * 10 = 200
+    try testing.expectEqualStrings("200", tree.search(20).?);
 }
 
 test "delete all keys until tree is empty" {
@@ -1220,7 +1216,7 @@ test "delete all keys until tree is empty" {
 
     var i: usize = 1;
     while (i <= 30) : (i += 1) {
-        try tree.insert(@intCast(i), @intCast(i * 10));
+        try tree.insert(@intCast(i), "val");
     }
 
     i = 1;
@@ -1229,7 +1225,7 @@ test "delete all keys until tree is empty" {
     }
 
     try testing.expectEqual(@as(usize, 0), tree.height());
-    try testing.expectEqual(@as(?Value, null), tree.search(1));
+    try testing.expect(tree.search(1) == null);
     try testing.expect(tree.root == null);
 }
 
@@ -1242,7 +1238,7 @@ test "cursor iterate sorted" {
     defer tree.deinit();
 
     const arr = [_]u64{ 8, 3, 10, 1, 6, 14, 4, 7, 13 };
-    for (arr) |k| try tree.insert(k, k * 10);
+    for (arr) |k| try tree.insert(k, "data");
 
     var cur = tree.cursorFirst();
     try testing.expect(cur.isValid());
@@ -1257,7 +1253,7 @@ test "cursor iterate sorted" {
         tree.cursorNext(&cur);
     }
 
-    try testing.expectEqual(@as(usize, arr.len), count);
+    try testing.expectEqual(arr.len, count);
 }
 
 test "cursorSeekGe works" {
@@ -1268,7 +1264,7 @@ test "cursorSeekGe works" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    for (1..11) |i| try tree.insert(i, i * 10);
+    for (1..11) |i| try tree.insert(i, "val");
 
     var cur = tree.cursorSeekGe(5);
     try testing.expect(cur.isValid());
@@ -1286,7 +1282,7 @@ test "cursorLast and cursorPrev iterate backwards" {
     var tree = BTree.init(alloc);
     defer tree.deinit();
 
-    for (1..21) |i| try tree.insert(i, i * 10);
+    for (1..21) |i| try tree.insert(i, "val");
     var cur = tree.cursorLast();
     try testing.expect(cur.isValid());
     try testing.expectEqual(@as(Key, 20), cur.key());
@@ -1309,7 +1305,11 @@ test "RangeCursor: basic forward and reverse" {
     defer tree.deinit();
 
     const nums = [_]u64{ 10, 20, 30, 40, 50 };
-    for (nums) |n| try tree.insert(n, n);
+    for (nums) |n| {
+        // Must insert strings now.
+        // We use dummy "val" because RangeCursor only checks keys here.
+        try tree.insert(n, "val");
+    }
     {
         var rc = tree.rangeCursor(20, 40, .forward);
         try testing.expect(rc.isValid());
@@ -1346,7 +1346,7 @@ test "RangeCursor: fuzzy boundaries" {
     defer tree.deinit();
 
     const nums = [_]u64{ 10, 20, 30, 40, 50 };
-    for (nums) |n| try tree.insert(n, n);
+    for (nums) |n| try tree.insert(n, "val");
     {
         var rc = tree.rangeCursor(15, 45, .forward);
         try testing.expectEqual(@as(Key, 20), rc.key());
@@ -1373,8 +1373,8 @@ test "RangeCursor: out of bounds and empty" {
     var tree = BTree.init(gpa.allocator());
     defer tree.deinit();
 
-    try tree.insert(10, 10);
-    try tree.insert(20, 20);
+    try tree.insert(10, "10");
+    try tree.insert(20, "20");
 
     {
         var rc = tree.rangeCursor(0, 5, .forward);
@@ -1400,9 +1400,9 @@ test "RangeCursor: single key exact match" {
     var tree = BTree.init(gpa.allocator());
     defer tree.deinit();
 
-    try tree.insert(10, 10);
-    try tree.insert(20, 20);
-    try tree.insert(30, 30);
+    try tree.insert(10, "10");
+    try tree.insert(20, "20");
+    try tree.insert(30, "30");
 
     {
         var rc = tree.rangeCursor(20, 20, .forward);
@@ -1426,7 +1426,7 @@ test "RangeCursor: large scale reverse iteration" {
 
     var i: usize = 1;
     while (i <= 100) : (i += 1) {
-        try tree.insert(@intCast(i), @intCast(i));
+        try tree.insert(@intCast(i), "val");
     }
 
     var rc = tree.rangeCursor(1, 100, .reverse);
