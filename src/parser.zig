@@ -11,6 +11,27 @@ pub const Value = union(enum) {
     text: []const u8,
 };
 
+pub const Operator = enum {
+    Equals,
+    NotEquals,
+    GreaterThan,
+    LessThan,
+    GTE,
+    LTE,
+    And,
+    Or,
+};
+
+pub const Expression = union(enum) {
+    Literal: Value,
+    Column: []const u8,
+    Binary: struct {
+        left: *Expression,
+        op: Operator,
+        right: *Expression,
+    },
+};
+
 pub const StatementType = enum {
     INSERT,
     SELECT,
@@ -23,6 +44,7 @@ pub const Statement = union(StatementType) {
     },
     SELECT: struct {
         table_name: []const u8,
+        where: ?*Expression,
     },
 };
 
@@ -54,12 +76,12 @@ pub const Parser = struct {
         };
     }
 
-    fn nextToken(self: *Parser) void {
+    fn nextToken(self: *Self) void {
         self.curr_tok = self.peek_tok;
         self.peek_tok = self.tokenizer.next();
     }
 
-    fn expectPeek(self: *Parser, expected: TokenType) !void {
+    fn expectPeek(self: *Self, expected: TokenType) !void {
         if (self.peek_tok.type == expected) {
             self.nextToken();
         } else {
@@ -67,7 +89,7 @@ pub const Parser = struct {
         }
     }
 
-    pub fn parse(self: *Parser) !Statement {
+    pub fn parse(self: *Self) !Statement {
         switch (self.curr_tok.type) {
             .KEYWORD_INSERT => return self.parseInsert(),
             .KEYWORD_SELECT => return self.parseSelect(),
@@ -123,13 +145,59 @@ pub const Parser = struct {
         try self.expectPeek(.IDENTIFIER);
 
         const table_name = self.curr_tok.lexeme;
+        var where_expr: ?*Expression = null;
+        if (self.peek_tok.type == .KEYWORD_WHERE) {
+            self.nextToken();
+            self.nextToken();
+            where_expr = try self.parseExpr();
+        }
         try self.expectPeek(.SYMBOL_SEMICOLON);
 
         return Statement{
             .SELECT = .{
                 .table_name = table_name,
+                .where = where_expr,
             },
         };
+    }
+
+    fn parseExpr(self: *Self) !*Expression {
+        if (self.curr_tok.type != .IDENTIFIER) return ParseError.UnexpectedToken;
+        const left_expr = try self.allocator.create(Expression);
+        left_expr.* = .{ .Column = self.curr_tok.lexeme };
+        self.nextToken();
+
+        const op = switch (self.curr_tok.type) {
+            .SYMBOL_EQUALS => Operator.Equals,
+            .SYMBOL_GT => Operator.GreaterThan,
+            .SYMBOL_GTE => Operator.GTE,
+            .SYMBOL_LT => Operator.LessThan,
+            .SYMBOL_LTE => Operator.LTE,
+            .SYMBOL_NEQ => Operator.NotEquals,
+            else => return ParseError.UnexpectedToken,
+        };
+
+        self.nextToken();
+        const right_expr = try self.allocator.create(Expression);
+        if (self.curr_tok.type == .LITERAL_NUMBER) {
+            const val = try std.fmt.parseInt(i64, self.curr_tok.lexeme, 10);
+            right_expr.* = .{ .Literal = .{ .integer = val } };
+        } else if (self.curr_tok.type == .LITERAL_STRING) {
+            right_expr.* = .{ .Literal = .{ .text = self.curr_tok.lexeme } };
+        } else {
+            return ParseError.UnexpectedToken;
+        }
+
+        const bin_expr = try self.allocator.create(Expression);
+        bin_expr.* = .{
+            .Binary = .{
+                .left = left_expr,
+                .op = op,
+                .right = right_expr,
+            },
+        };
+
+        return bin_expr;
     }
 };
 
@@ -188,4 +256,40 @@ test "parser: error on malformed insert" {
     var p = Parser.init(testing.allocator, sql);
     const result = p.parse();
     try testing.expectError(ParseError.UnexpectedToken, result);
+}
+
+test "parser: select with where clause" {
+    const sql = "SELECT * FROM users WHERE id = 5;";
+    var p = Parser.init(testing.allocator, sql);
+    const stmt = try p.parse();
+    defer {
+        switch (stmt) {
+            .SELECT => |sel| {
+                if (sel.where) |expr| {
+                    testing.allocator.destroy(expr.Binary.left);
+                    testing.allocator.destroy(expr.Binary.right);
+                    testing.allocator.destroy(expr);
+                }
+            },
+            else => {},
+        }
+    }
+
+    switch (stmt) {
+        .SELECT => |sel| {
+            try testing.expectEqualStrings("users", sel.table_name);
+            try testing.expect(sel.where != null);
+
+            const expr = sel.where.?;
+            switch (expr.*) {
+                .Binary => |b| {
+                    try testing.expectEqual(Operator.Equals, b.op);
+                    try testing.expectEqualStrings("id", b.left.Column);
+                    try testing.expectEqual(5, b.right.Literal.integer);
+                },
+                else => try testing.expect(false),
+            }
+        },
+        else => try testing.expect(false),
+    }
 }

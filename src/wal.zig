@@ -291,21 +291,13 @@ test "WAL appendSet writes correct bytes" {
     off += 1;
 
     const key_slice = buf[off .. off + 8];
-    const read_key = mem.readInt(
-        u64,
-        @ptrCast(key_slice.ptr),
-        .little,
-    );
+    const read_key = mem.readInt(u64, @ptrCast(key_slice.ptr), .little);
 
     try testing.expectEqual(key, read_key);
     off += 8;
 
     const len_slice = buf[off .. off + 4];
-    const len = mem.readInt(
-        u32,
-        @ptrCast(len_slice.ptr),
-        .little,
-    );
+    const len = mem.readInt(u32, @ptrCast(len_slice.ptr), .little);
 
     try testing.expectEqual(@as(u32, value.len), len);
     off += 4;
@@ -392,7 +384,7 @@ test "WAL replayFn reconstructs BTree for SET records" {
 
         pub fn handleSet(self: *Self, key: Key, value: []const u8) !void {
             self.set_count.* += 1;
-            try self.index.insert(key, @as(u64, value.len));
+            try self.index.insert(key, value);
         }
 
         pub fn handleDelete(self: *Self, key: Key) !void {
@@ -407,8 +399,8 @@ test "WAL replayFn reconstructs BTree for SET records" {
 
     try wal.replayFn(gpa.allocator(), &handler);
 
-    try testing.expectEqual(@as(?u64, 3), index.search(10));
-    try testing.expectEqual(@as(?u64, 6), index.search(20));
+    try testing.expectEqualStrings("foo", index.search(10).?);
+    try testing.expectEqualStrings("hello!", index.search(20).?);
     try testing.expectEqual(@as(usize, 2), set_count);
 }
 
@@ -438,7 +430,7 @@ test "WAL replayFn applies DELETE records" {
         const Self = @This();
 
         pub fn handleSet(self: *Self, key: Key, value: []const u8) !void {
-            try self.index.insert(key, @as(u64, value.len));
+            try self.index.insert(key, value);
         }
 
         pub fn handleDelete(self: *Self, key: Key) !void {
@@ -494,7 +486,7 @@ test "WAL replayFn stops cleanly on truncated/partial record" {
 
         pub fn handleSet(self: *Self, key: Key, value: []const u8) !void {
             self.invoked_flag.* = true; // MUST NEVER HAPPEN
-            try self.index.insert(key, @as(u64, value.len));
+            try self.index.insert(key, value);
         }
 
         pub fn handleDelete(self: *Self, _: Key) !void {

@@ -4,16 +4,11 @@ const mem = std.mem;
 const testing = std.testing;
 
 const Pager = @import("pager.zig").Pager;
-const Page = @import("page.zig").Page;
 const BTree = @import("btree.zig").BTree;
 const Key = @import("btree.zig").Key;
 const Wal = @import("wal.zig").Wal;
-const RecordRef = @import("record_ref.zig").RecordRef;
 
-pub const DbError = error{
-    ValueTooLarge,
-    OutOfSpace,
-} || fs.File.ReadError || fs.File.WriteError;
+pub const DbError = fs.File.ReadError || fs.File.WriteError || mem.Allocator.Error;
 
 pub const Db = struct {
     allocator: mem.Allocator,
@@ -48,8 +43,7 @@ pub const Db = struct {
 
             const HandlerCtx = @This();
             pub fn handleSet(ctx: *HandlerCtx, key: Key, value: []const u8) !void {
-                const ref = try ctx.db.writeValue(value);
-                try ctx.db.index.insert(key, ref.encode());
+                try ctx.db.index.insert(key, value);
             }
 
             pub fn handleDelete(ctx: *HandlerCtx, key: Key) !void {
@@ -62,64 +56,18 @@ pub const Db = struct {
         try wal.replayFn(self.allocator, &handler);
     }
 
-    fn writeValue(self: *Self, value: []const u8) !RecordRef {
-        if (value.len > std.math.maxInt(u16)) return DbError.ValueTooLarge;
-
-        const page_id: u32 = 0;
-        var entry = try self.pager.get(page_id);
-        defer self.pager.unpin(entry);
-
-        const needed: u16 = @intCast(value.len);
-        if (!entry.page.canInsert(needed)) {
-            entry.page.defragment();
-            if (!entry.page.canInsert(needed)) {
-                return DbError.OutOfSpace;
-            }
-        }
-
-        const slot = try entry.page.insert(value);
-        self.pager.makeDirty(entry);
-
-        return RecordRef{
-            .page_id = page_id,
-            .slot = slot,
-        };
-    }
-
-    fn readValue(self: *Self, ref: RecordRef) !?[]const u8 {
-        var entry = try self.pager.get(ref.page_id);
-        defer self.pager.unpin(entry);
-        return entry.page.get(ref.slot);
-    }
-
-    fn deleteValue(self: *Self, ref: RecordRef) !void {
-        var entry = try self.pager.get(ref.page_id);
-        defer self.pager.unpin(entry);
-        try entry.page.delete(ref.slot);
-        self.pager.makeDirty(entry);
-    }
-
     pub fn set(self: *Self, key: Key, value: []const u8) !void {
         _ = try self.pager.getWal().appendSet(key, value);
-        const ref = try self.writeValue(value);
-        try self.index.insert(key, ref.encode());
+        try self.index.insert(key, value);
     }
 
     pub fn get(self: *Self, key: Key) !?[]const u8 {
-        if (self.index.search(key)) |encoded_ref| {
-            const ref = RecordRef.decode(encoded_ref);
-            return try self.readValue(ref);
-        }
-        return null;
+        return self.index.search(key);
     }
 
     pub fn delete(self: *Self, key: Key) !void {
         _ = try self.pager.getWal().appendDelete(key);
-        if (self.index.search(key)) |enc_ref| {
-            const ref = RecordRef.decode(enc_ref);
-            try self.deleteValue(ref);
-            self.index.delete(key);
-        }
+        self.index.delete(key);
     }
 };
 
@@ -163,8 +111,10 @@ test "Db persists across reopen via WAL replay" {
         try db.set(1, "alpha");
         try db.set(2, "beta");
         try db.set(3, "gamma");
+        //delete '2' to ensure deletions replay correctly too
+        try db.delete(2);
     }
-
+    // 2. Re-Open, Verify State
     {
         var db = try Db.open(tmp.dir, path, alloc);
         defer db.close() catch {};
@@ -174,8 +124,7 @@ test "Db persists across reopen via WAL replay" {
         try testing.expectEqualSlices(u8, "alpha", v1.?);
 
         const v2 = try db.get(2);
-        try testing.expect(v2 != null);
-        try testing.expectEqualSlices(u8, "beta", v2.?);
+        try testing.expect(v2 == null);
 
         const v3 = try db.get(3);
         try testing.expect(v3 != null);
